@@ -105,8 +105,11 @@ const wifiBrowserMigrationKey = "pilas.wifiBrowserDefault.v1";
 const ndsFrameRate = 59.8261;
 const frameIntervalMs = 1000 / ndsFrameRate;
 const maxFramesPerTick = 3;
+const maxCatchUpMs = frameIntervalMs * 2;
 const savePollIntervalMs = 500;
-const storageSyncIntervalMs = 5000;
+// Larger images are rewritten to IndexedDB 
+const storageSyncStableMs = 1500;
+const storageSyncMaxWaitMs = 30000;
 const browserStateSlots = 6;
 const cameraWidth = 640;
 const cameraHeight = 480;
@@ -125,14 +128,19 @@ let stateStem = "";
 let romDisplayName = "";
 let saveDirty = false;
 let firmwareDirty = false;
-let syncInFlight = false;
+let syncInFlight = null;
+let loading = false;
+let syncChain = Promise.resolve();
+let syncPending = null;
+let storageSignature = null;
+let storageChangedAt = 0;
+let storageDirtySince = 0;
 let keyboardMask = 0xFFF;
 let padMask = 0xFFF;
 let touchButtonMask = 0xFFF;
 let lastFpsTime = performance.now();
 let lastTickTime = performance.now();
 let lastSavePollTime = 0;
-let lastStorageSyncTime = 0;
 let emulationAccumulator = 0;
 let framesSinceFps = 0;
 let lastRtcUpdate = 0;
@@ -575,6 +583,10 @@ class AudioEngine {
   async startPreferred() {
     if (!this.preferred || this.enabled) return;
     await this.start();
+  }
+
+  clear() {
+    this.node?.port.postMessage({ type: "clear" });
   }
 
   pump() {
@@ -1762,13 +1774,27 @@ function formatBytes(bytes) {
   return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
 }
 
-function syncfs(populate) {
+function rawSyncfs(populate) {
   return new Promise((resolve, reject) => {
     Module.FS.syncfs(populate, (err) => {
       if (err) reject(err);
       else resolve();
     });
   });
+}
+
+// Persist calls are serialized and coalesced if a sync is already queued but has not started, callers share it instead of stacking up more full-tree IndexedDB scans.
+function syncfs(populate) {
+  if (populate) return rawSyncfs(true);
+  if (syncPending) return syncPending;
+
+  const run = syncChain.then(() => {
+    syncPending = null;
+    return rawSyncfs(false);
+  });
+  syncPending = run;
+  syncChain = run.catch(() => {});
+  return run;
 }
 
 async function initStorage() {
@@ -2318,8 +2344,7 @@ function loadSavestateBytes(bytes) {
 
   if (!ok) throw new Error(cString(Module._pilas_last_error(instance)) || "Failed to load state");
 
-  emulationAccumulator = 0;
-  lastTickTime = performance.now();
+  resetPacing();
   renderFrame();
 }
 
@@ -2432,9 +2457,19 @@ async function loadRom(file) {
 }
 
 async function loadRomBytes(romBytes, romName = "game.nds") {
-  if (!Module || !instance || !romBytes?.length) return;
+  if (!Module || !instance || !romBytes?.length || loading) return;
 
-  await flushSaves(true);
+  loading = true;
+  try {
+    await loadRomBytesInner(romBytes, romName);
+  } finally {
+    loading = false;
+    resetPacing();
+  }
+}
+
+async function loadRomBytesInner(romBytes, romName) {
+  if (romLoaded) await flushSaves(true);
   applyConsoleMode();
   applyBootOptions();
   applyDsiStorageOptions(false);
@@ -2461,10 +2496,7 @@ async function loadRomBytes(romBytes, romName = "game.nds") {
 
   romLoaded = true;
   paused = false;
-  emulationAccumulator = 0;
-  lastTickTime = performance.now();
-  lastFpsTime = lastTickTime;
-  framesSinceFps = 0;
+  resetPacing();
   saveDirty = false;
   pauseBtn.disabled = false;
   resetBtn.disabled = false;
@@ -2479,10 +2511,11 @@ async function loadRomBytes(romBytes, romName = "game.nds") {
 }
 
 async function bootFirmwareMenu() {
-  if (!Module || !instance) return;
+  if (!Module || !instance || loading) return;
 
+  loading = true;
   try {
-    await flushSaves(true);
+    if (romLoaded) await flushSaves(true);
     applyConsoleMode();
     applyBootOptions();
     applyDsiStorageOptions(false);
@@ -2498,10 +2531,7 @@ async function bootFirmwareMenu() {
     const mode = consoleModeSelect.value === "dsi" ? "dsi" : "ds";
     stateStem = `${mode}-firmware-menu`;
     romDisplayName = mode === "dsi" ? "DSi firmware menu" : "DS firmware menu";
-    emulationAccumulator = 0;
-    lastTickTime = performance.now();
-    lastFpsTime = lastTickTime;
-    framesSinceFps = 0;
+    resetPacing();
     saveDirty = false;
     pauseBtn.disabled = false;
     resetBtn.disabled = false;
@@ -2515,6 +2545,9 @@ async function bootFirmwareMenu() {
   } catch (error) {
     console.error(error);
     setStatus(error.message);
+  } finally {
+    loading = false;
+    resetPacing();
   }
 }
 
@@ -2628,7 +2661,11 @@ function setTouchFromPointer(event, active) {
 }
 
 async function flushSaves(force = false) {
-  if (!Module || !instance || syncInFlight) return;
+  if (!Module || !instance) return;
+  while (syncInFlight) {
+    if (!force) return;
+    await syncInFlight;
+  }
   if (!romLoaded) {
     if (force) await syncStorageSnapshot();
     return;
@@ -2638,7 +2675,8 @@ async function flushSaves(force = false) {
   if (Module._pilas_take_firmware_dirty(instance)) firmwareDirty = true;
   if (!force && !saveDirty && !firmwareDirty) return;
 
-  syncInFlight = true;
+  let releaseSync;
+  syncInFlight = new Promise((resolve) => { releaseSync = resolve; });
   try {
     if (saveDirty && savePath) {
       const ptr = Module._pilas_get_nds_save_ptr(instance);
@@ -2671,21 +2709,72 @@ async function flushSaves(force = false) {
     saveValue.textContent = "error";
     console.error(error);
   } finally {
-    syncInFlight = false;
+    syncInFlight = null;
+    releaseSync();
   }
 }
 
 async function syncStorageSnapshot() {
   if (!Module || syncInFlight) return;
-  syncInFlight = true;
+  let releaseSync;
+  syncInFlight = new Promise((resolve) => { releaseSync = resolve; });
   try {
     await syncfs(false);
     updateStorageInfo();
   } catch (error) {
     console.error(error);
   } finally {
-    syncInFlight = false;
+    syncInFlight = null;
+    releaseSync();
   }
+}
+
+function storageFileSignature() {
+  let signature = "";
+  for (const path of [dsiNandPath, dsiSdPath, dldiSdPath]) {
+    try {
+      const stat = Module.FS.stat(path);
+      signature += `${stat.size}:${stat.mtime instanceof Date ? stat.mtime.getTime() : stat.mtime};`;
+    } catch {
+      signature += "-;";
+    }
+  }
+  return signature;
+}
+
+// Only touches IndexedDB when big disk images changed and waits until writes settle so a game
+// that streams to the SD card doesn't trigger a multi MB rewrite every tick.
+function pollStorageChanges(now) {
+  if (!Module || syncInFlight) return;
+
+  const signature = storageFileSignature();
+  if (storageSignature === null) {
+    storageSignature = signature;
+    storageChangedAt = now;
+    storageDirtySince = now;
+    return;
+  }
+
+  if (signature !== storageSignature) {
+    storageSignature = signature;
+    storageChangedAt = now;
+    if (!storageDirtySince) storageDirtySince = now;
+    return;
+  }
+
+  if (!storageDirtySince) return;
+  if (now - storageChangedAt >= storageSyncStableMs || now - storageDirtySince >= storageSyncMaxWaitMs) {
+    storageDirtySince = 0;
+    syncStorageSnapshot();
+  }
+}
+
+function resetPacing() {
+  emulationAccumulator = 0;
+  lastTickTime = performance.now();
+  lastFpsTime = lastTickTime;
+  framesSinceFps = 0;
+  audio.clear();
 }
 
 function startLoop() {
@@ -2695,10 +2784,10 @@ function startLoop() {
 }
 
 function tick(now) {
-  if (romLoaded && !paused) {
+  if (romLoaded && !paused && !loading) {
     pollGamepad();
 
-    const elapsed = Math.min(now - lastTickTime, 250);
+    const elapsed = Math.min(now - lastTickTime, maxCatchUpMs);
     lastTickTime = now;
     emulationAccumulator += elapsed;
 
@@ -2711,6 +2800,8 @@ function tick(now) {
       framesThisTick++;
     }
 
+    if (emulationAccumulator > frameIntervalMs) emulationAccumulator = frameIntervalMs;
+
     if (framesThisTick > 0) {
       renderFrame();
       framesSinceFps += framesThisTick;
@@ -2718,12 +2809,8 @@ function tick(now) {
 
     if (now - lastSavePollTime >= savePollIntervalMs) {
       flushSaves(false);
+      pollStorageChanges(now);
       lastSavePollTime = now;
-    }
-
-    if (now - lastStorageSyncTime >= storageSyncIntervalMs) {
-      syncStorageSnapshot();
-      lastStorageSyncTime = now;
     }
 
     if (now - lastFpsTime >= 1000) {
@@ -3074,6 +3161,12 @@ window.addEventListener("click", () => {
 }, { passive: true });
 
 window.addEventListener("resize", updateDeviceClass);
+
+// Browsers throttle or pause rAF in background tabs.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resetPacing();
+  else flushSaves(false);
+});
 
 document.addEventListener("fullscreenchange", syncFullscreenClass);
 

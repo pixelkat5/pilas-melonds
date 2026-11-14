@@ -529,6 +529,9 @@ class AudioEngine {
     this.preferred = true;
     this.bufferPtr = 0;
     this.maxFrames = 2048;
+    this.gainNode = null;
+    this.pausedByVisibility = false;
+    this.transition = 0;
   }
 
   async start() {
@@ -549,11 +552,15 @@ class AudioEngine {
         numberOfOutputs: 1,
         outputChannelCount: [2],
       });
-      this.node.connect(this.context.destination);
+      this.gainNode = this.context.createGain();
+      this.node.connect(this.gainNode);
+      this.gainNode.connect(this.context.destination);
       this.bufferPtr = Module._malloc(this.maxFrames * 2 * 2);
     }
 
     try {
+      this.gainNode?.gain.cancelScheduledValues(this.context.currentTime);
+      this.gainNode?.gain.setValueAtTime(1, this.context.currentTime);
       await this.context.resume();
       this.enabled = true;
       this.preferred = true;
@@ -589,8 +596,55 @@ class AudioEngine {
     this.node?.port.postMessage({ type: "clear" });
   }
 
+  // Discard whatever the core produced while nobody was consuming audio.
+  drain() {
+    if (!Module || !instance || !this.bufferPtr) return;
+    for (let i = 0; i < 16; i++) {
+      if (Module._pilas_pull_audio(instance, this.bufferPtr, this.maxFrames) <= 0) break;
+    }
+  }
+
+  // Tab hidden: rAF stops, so the emulator stops feeding the worklet. 
+  async suspendForBackground() {
+    if (!this.enabled || !this.context || this.pausedByVisibility) return;
+    this.pausedByVisibility = true;
+    const token = ++this.transition;
+    const ctx = this.context;
+    const gain = this.gainNode?.gain;
+    if (gain) {
+      gain.cancelScheduledValues(ctx.currentTime);
+      gain.setValueAtTime(gain.value, ctx.currentTime);
+      gain.linearRampToValueAtTime(0, ctx.currentTime + 0.04);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    if (token !== this.transition || !this.pausedByVisibility) return;
+    this.clear();
+    try { await ctx.suspend(); } catch (error) { console.warn(error); }
+  }
+
+  async resumeFromBackground() {
+    if (!this.pausedByVisibility) return;
+    this.pausedByVisibility = false;
+    ++this.transition;
+    if (!this.enabled || !this.context) return;
+    this.clear();
+    this.drain();
+    try {
+      const ctx = this.context;
+      const gain = this.gainNode?.gain;
+      if (gain) {
+        gain.cancelScheduledValues(ctx.currentTime);
+        gain.setValueAtTime(0, ctx.currentTime);
+        gain.linearRampToValueAtTime(1, ctx.currentTime + 0.05);
+      }
+      await ctx.resume();
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+
   pump() {
-    if (!this.enabled || !this.node || !this.bufferPtr) return;
+    if (!this.enabled || !this.node || !this.bufferPtr || this.pausedByVisibility) return;
     if (this.context.state !== "running") return;
 
     const frames = Module._pilas_pull_audio(instance, this.bufferPtr, this.maxFrames);
@@ -2784,7 +2838,7 @@ function startLoop() {
 }
 
 function tick(now) {
-  if (romLoaded && !paused && !loading) {
+  if (romLoaded && !paused && !loading && !document.hidden) {
     pollGamepad();
 
     const elapsed = Math.min(now - lastTickTime, maxCatchUpMs);
@@ -3164,8 +3218,13 @@ window.addEventListener("resize", updateDeviceClass);
 
 // Browsers throttle or pause rAF in background tabs.
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") resetPacing();
-  else flushSaves(false);
+  if (document.visibilityState === "visible") {
+    audio.resumeFromBackground();
+    resetPacing();
+  } else {
+    audio.suspendForBackground();
+    flushSaves(false);
+  }
 });
 
 document.addEventListener("fullscreenchange", syncFullscreenClass);

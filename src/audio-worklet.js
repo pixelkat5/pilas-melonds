@@ -6,6 +6,10 @@ class PilasAudioWorklet extends AudioWorkletProcessor {
     this.offset = 0;
     this.available = 0;
     this.primed = false;
+    this.lastLeft = 0;
+    this.lastRight = 0;
+    this.fadeIn = 0;
+    this.fadeInFrames = 128;
     this.prebufferFrames = 1600;
     this.maxBufferedFrames = 4800;
 
@@ -26,6 +30,7 @@ class PilasAudioWorklet extends AudioWorkletProcessor {
         this.offset = 0;
         this.available = 0;
         this.primed = false;
+        this.fadeIn = 0;
       }
     };
   }
@@ -39,6 +44,9 @@ class PilasAudioWorklet extends AudioWorkletProcessor {
     if (!this.primed) {
       if (this.available >= this.prebufferFrames) {
         this.primed = true;
+        this.fadeIn = 0;
+        this.lastLeft = 0;
+        this.lastRight = 0;
       } else {
         left.fill(0);
         if (right !== left) right.fill(0);
@@ -54,16 +62,29 @@ class PilasAudioWorklet extends AudioWorkletProcessor {
         if (!this.current) {
           this.primed = false;
           this.available = 0;
+          const remaining = count - i;
           for (let j = i; j < count; j++) {
-            left[j] = 0;
-            right[j] = 0;
+            const g = 1 - (j - i + 1) / remaining;
+            left[j] = this.lastLeft * g;
+            right[j] = this.lastRight * g;
           }
+          this.lastLeft = 0;
+          this.lastRight = 0;
           return true;
         }
       }
 
-      left[i] = this.current[this.offset];
-      right[i] = this.current[this.offset + 1];
+      let l = this.current[this.offset];
+      let r = this.current[this.offset + 1];
+      if (this.fadeIn < this.fadeInFrames) {
+        const g = (++this.fadeIn) / this.fadeInFrames;
+        l *= g;
+        r *= g;
+      }
+      this.lastLeft = l;
+      this.lastRight = r;
+      left[i] = l;
+      right[i] = r;
       this.offset += 2;
       this.available--;
     }
